@@ -36,6 +36,13 @@ class BaseQuestionnaire(models.Model):
     def calculate_progress(self):
         # Override in subclasses
         pass
+
+    def get_section_progress(self):
+        """Get progress by section"""
+        return {
+            section: self.calculate_section_progress(section)
+            for section in self.get_sections()
+        }
     
     class Meta:
         abstract = True

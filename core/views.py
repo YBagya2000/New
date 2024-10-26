@@ -290,24 +290,30 @@ class ContextualQuestionnaireView(APIView):
 
     def get(self, request, action=None):
         """Get questionnaire structure or current progress"""
-        # Validate sequence
-        QuestionnaireSequenceValidator.validate_contextual_status(request.user)
+        try:
+            # Validate sequence
+            QuestionnaireSequenceValidator.validate_contextual_status(request.user)
 
-        # Get or create questionnaire
-        questionnaire, created = ContextualQuestionnaire.objects.get_or_create(
-            vendor=request.user,
-            defaults={'status': 'In Progress'}
-        )
-        
-        # Get all questions with choices
-        questions = ContextualQuestion.objects.prefetch_related('choices').all().order_by('order')
-        
-        return Response({
-            'questionnaire_id': questionnaire.id,
-            'status': questionnaire.status,
-            'progress': questionnaire.progress,
-            'questions': ContextualQuestionSerializer(questions, many=True).data
-        })
+            # Get or create questionnaire
+            questionnaire, created = ContextualQuestionnaire.objects.get_or_create(
+                vendor=request.user,
+                defaults={'status': 'In Progress'}
+            )
+            
+            # Get all questions with choices
+            questions = ContextualQuestion.objects.prefetch_related('choices').all().order_by('order')
+            
+            return Response({
+                'questionnaire_id': questionnaire.id,
+                'status': questionnaire.status,
+                'progress': questionnaire.progress,
+                'questions': ContextualQuestionSerializer(questions, many=True).data
+            })
+        except ValidationError as e:
+            return Response(
+                {'error': e.messages[0] if isinstance(e.messages, list) else str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
     @transaction.atomic
     def post(self, request, action=None):
@@ -434,6 +440,13 @@ class RiskAssessmentQuestionnaireView(APIView):
             elif question.type == 'SA':
                 if not isinstance(answer, str) or not answer.strip():
                     raise ValidationError(f'Text answer required for question {question.id}')
+                
+    def validate_prerequisites(self, user):
+        if not user.corporatequestionnaire_set.filter(status='Submitted').exists():
+            raise ValidationError("Complete corporate questionnaire first")
+        if not user.contextualquestionnaire_set.filter(status='Submitted').exists():
+            raise ValidationError("Complete contextual questionnaire first")
+
 
     def get(self, request, action=None):
         # Validate sequence
