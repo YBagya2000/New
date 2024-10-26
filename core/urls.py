@@ -28,30 +28,22 @@ urlpatterns = [
         name='corporate-questionnaire'
     ),
     path(f'{API_VERSION}/vendor/questionnaires/corporate/save/', 
-        views.CorporateQuestionnaireView.as_view(), 
-        {'action': 'save'},
+        views.CorporateQuestionnaireSaveView.as_view(), 
         name='corporate-save'
     ),
     path(f'{API_VERSION}/vendor/questionnaires/corporate/submit/', 
-        views.CorporateQuestionnaireView.as_view(), 
-        {'action': 'submit'},
+        views.CorporateQuestionnaireSubmitView.as_view(), 
         name='corporate-submit'
     ),
     
     # Contextual Questionnaire
     path(f'{API_VERSION}/vendor/questionnaires/contextual/', 
-        views.ContextualQuestionnaireView.as_view(), 
-        name='contextual-questionnaire'
+    views.ContextualQuestionnaireView.as_view(),
+    name='contextual-questionnaire'
     ),
-    path(f'{API_VERSION}/vendor/questionnaires/contextual/save/', 
-        views.ContextualQuestionnaireView.as_view(), 
-        {'action': 'save'},
-        name='contextual-save'
-    ),
-    path(f'{API_VERSION}/vendor/questionnaires/contextual/submit/', 
-        views.ContextualQuestionnaireView.as_view(), 
-        {'action': 'submit'},
-        name='contextual-submit'
+    path(f'{API_VERSION}/vendor/questionnaires/contextual/<str:action>/', 
+        views.ContextualQuestionnaireView.as_view(),
+        name='contextual-action'
     ),
     
     # Risk Assessment
@@ -82,18 +74,24 @@ urlpatterns = [
         name='ra-team-dashboard'
     ),
     path(f'{API_VERSION}/ra-team/submissions/', 
-        views.RATeamSubmissionView.as_view(), 
-        name='submissions-list'
+    views.RATeamSubmissionView.as_view(), 
+    name='submissions-list'
     ),
+
+    # Route for specific submission
     path(f'{API_VERSION}/ra-team/submissions/<int:submission_id>/', 
         views.RATeamSubmissionView.as_view(), 
         name='submission-detail'
     ),
+
+    # Route for scoring
     path(f'{API_VERSION}/ra-team/submissions/<int:submission_id>/score/', 
         views.RATeamSubmissionView.as_view(), 
         {'action': 'score'},
         name='submission-score'
     ),
+
+    # Route for completing review
     path(f'{API_VERSION}/ra-team/submissions/<int:submission_id>/complete/', 
         views.RATeamSubmissionView.as_view(), 
         {'action': 'complete'},

@@ -110,10 +110,6 @@ MEDIA_ROOT = BASE_DIR / 'media'
 MAX_UPLOAD_SIZE = 5 * 1024 * 1024  # 5MB
 ALLOWED_UPLOAD_TYPES = ['pdf', 'doc', 'docx', 'txt']
 
-# Celery Settings
-CELERY_BROKER_URL = 'redis://localhost:6379/0'
-CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
-
 # CORS Settings
 CORS_ALLOW_ALL_ORIGINS = True  # For development only
 

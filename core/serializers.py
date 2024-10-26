@@ -132,6 +132,7 @@ class RiskAssessmentResponseSerializer(serializers.ModelSerializer):
         fields = ('id', 'question', 'response_text', 'selected_choice', 'yes_no_response')
 
 class RiskAssessmentQuestionnaireSerializer(serializers.ModelSerializer):
+    main_factors = MainRiskFactorSerializer(many=True, read_only=True, source='main_factors.all')
     responses = RiskAssessmentResponseSerializer(many=True, read_only=True)
     documents = DocumentSubmissionSerializer(many=True, read_only=True)
     

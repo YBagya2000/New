@@ -183,8 +183,19 @@ class QuestionChoice(models.Model):
 
     def __str__(self):
         return f"{self.text} (Score: {self.score})"
+    
+class RiskAssessmentQuestionnaireManager(models.Manager):
+    def get_pending_reviews(self):
+        return self.filter(status='Submitted')
+    
+    def get_in_progress(self):
+        return self.filter(status='In Progress')
+    
+    def get_completed(self):
+        return self.filter(status='Completed')
 
 class RiskAssessmentQuestionnaire(BaseQuestionnaire):
+    objects = RiskAssessmentQuestionnaireManager()
     vendor = models.ForeignKey(User, on_delete=models.CASCADE)
     submission_date = models.DateTimeField(auto_now_add=True)
     status = models.CharField(
@@ -214,6 +225,11 @@ class RiskAssessmentResponse(models.Model):
     response_text = models.TextField(null=True, blank=True)
     selected_choice = models.ForeignKey(QuestionChoice, null=True, blank=True, on_delete=models.SET_NULL)
     yes_no_response = models.BooleanField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['questionnaire', 'question'])
+        ]
 
     def __str__(self):
         return f"Response to {self.question.text}"
@@ -248,11 +264,19 @@ class RATeamReview(models.Model):
 class ManualScore(models.Model):
     review = models.ForeignKey(RATeamReview, on_delete=models.CASCADE, related_name='scores')
     question = models.ForeignKey(Question, on_delete=models.CASCADE)
-    score = models.FloatField(validators=[MinValueValidator(0), MaxValueValidator(10)])
+    score = models.FloatField(
+        validators=[MinValueValidator(0), MaxValueValidator(10)],
+        help_text="Score between 0-10"
+    )
     comment = models.TextField(blank=True)
 
-    def __str__(self):
-        return f"Score for {self.question.text}"
+    def clean(self):
+        if not 0 <= self.score <= 10:
+            raise ValidationError("Score must be between 0 and 10")
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
 
 class RiskCalculation(models.Model):
     questionnaire = models.OneToOneField(RiskAssessmentQuestionnaire, on_delete=models.CASCADE, related_name='risk_calculation')
@@ -268,17 +292,6 @@ class RiskCalculation(models.Model):
     def __str__(self):
         return f"Risk Calculation for {self.questionnaire.vendor.email}"
     
-class BaseQuestionnaire(models.Model):
-    progress = models.FloatField(default=0.0)
-    last_modified = models.DateTimeField(auto_now=True)
-    
-    def calculate_progress(self):
-        # Override in subclasses
-        pass
-    
-    class Meta:
-        abstract = True
-
 # Add audit logging
 class AuditLog(models.Model):
     user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)

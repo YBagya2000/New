@@ -10,7 +10,7 @@ from django.db import transaction
 from rest_framework.permissions import AllowAny, IsAuthenticated, BasePermission
 from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
-from .tasks import calculate_risk_async
+from .tasks import calculate_risk
 from risk_assessment_system import settings
 from .models import *
 from .serializers import *
@@ -141,6 +141,9 @@ class CorporateQuestionnaireView(APIView):
     permission_classes = (IsVendor,)
 
     def get(self, request):
+        # Validate sequence
+        QuestionnaireSequenceValidator.validate_corporate_status(request.user)
+
         # Get or create questionnaire
         questionnaire, created = CorporateQuestionnaire.objects.get_or_create(
             vendor=request.user,
@@ -157,6 +160,51 @@ class CorporateQuestionnaireView(APIView):
             'questions': CorporateQuestionStructureSerializer(questions, many=True).data
         })
 
+class CorporateQuestionnaireSaveView(APIView):
+    permission_classes = (IsVendor,)
+
+    @transaction.atomic
+    def post(self, request):
+        questionnaire = get_object_or_404(
+            CorporateQuestionnaire, 
+            vendor=request.user
+        )
+            
+        if questionnaire.status == 'Submitted':
+            return Response(
+                {'error': 'Questionnaire already submitted'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Save responses
+        responses = request.data.get('responses', [])
+        for response_data in responses:
+            question = get_object_or_404(
+                CorporateQuestionStructure, 
+                id=response_data.get('question_id')
+            )
+                
+            response, created = CorporateQuestionnaireResponse.objects.update_or_create(
+                questionnaire=questionnaire,
+                question=question,
+                defaults={'response_text': response_data.get('response_text')}
+            )
+
+        # Update progress
+        total_questions = CorporateQuestionStructure.objects.count()
+        answered_questions = questionnaire.responses.count()
+        questionnaire.progress = (answered_questions / total_questions) * 100
+        questionnaire.save()
+
+        return Response({
+            'status': questionnaire.status,
+            'progress': questionnaire.progress,
+            'message': 'Responses saved successfully'
+        })
+        
+class CorporateQuestionnaireSubmitView(APIView):
+    permission_classes = (IsVendor,)
+
     @transaction.atomic
     def post(self, request):
         questionnaire = get_object_or_404(
@@ -170,7 +218,7 @@ class CorporateQuestionnaireView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Validate and save responses
+        # Save and validate responses
         responses = request.data.get('responses', [])
         for response_data in responses:
             question = get_object_or_404(
@@ -184,44 +232,66 @@ class CorporateQuestionnaireView(APIView):
                 defaults={'response_text': response_data.get('response_text')}
             )
 
-        # Update progress
+        # Validate all questions are answered
         total_questions = CorporateQuestionStructure.objects.count()
         answered_questions = questionnaire.responses.count()
-        questionnaire.progress = (answered_questions / total_questions) * 100
         
-        # If submitting final
-        if request.data.get('submit', False):
-            if answered_questions < total_questions:
-                return Response(
-                    {'error': 'All questions must be answered before submission'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            questionnaire.status = 'Submitted'
-            
+        if answered_questions < total_questions:
+            return Response(
+                {'error': 'All questions must be answered before submission'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Update status and progress
+        questionnaire.progress = 100
+        questionnaire.status = 'Submitted'
         questionnaire.save()
 
         return Response({
             'status': questionnaire.status,
             'progress': questionnaire.progress,
-            'message': 'Responses saved successfully'
+            'message': 'Questionnaire submitted successfully'
         })
 
 # Contextual Questionnaire Views
+# core/views.py
+
 class ContextualQuestionnaireView(APIView):
     permission_classes = (IsVendor,)
 
-    def get(self, request):
-        # Check if corporate questionnaire is completed
-        corporate = CorporateQuestionnaire.objects.filter(
-            vendor=request.user, 
-            status='Submitted'
-        ).exists()
-        
-        if not corporate:
-            return Response(
-                {'error': 'Please complete corporate questionnaire first'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+    def validate_completion(self, questionnaire):
+        """Validate all questions are answered"""
+        total_questions = ContextualQuestion.objects.count()
+        answered_questions = questionnaire.responses.count()
+        return answered_questions >= total_questions
+
+    def calculate_progress(self, questionnaire):
+        """Calculate current progress percentage"""
+        total_questions = ContextualQuestion.objects.count()
+        answered_questions = questionnaire.responses.count()
+        return (answered_questions / total_questions * 100) if total_questions > 0 else 0
+
+    def calculate_risk_modifier(self, responses):
+        """Calculate the total risk modifier from responses"""
+        total_modifier = 0
+        total_weight = 0
+
+        for response in responses:
+            question = response.question
+            choice = response.selected_choice
+            weighted_modifier = (choice.modifier * question.weight / 100)
+            total_modifier += weighted_modifier
+            total_weight += question.weight
+
+        if total_weight == 0:
+            raise ValidationError("Invalid weights in questionnaire")
+
+        return total_modifier / total_weight
+
+    def get(self, request, action=None):
+        """Get questionnaire structure or current progress"""
+        # Validate sequence
+        QuestionnaireSequenceValidator.validate_contextual_status(request.user)
 
         # Get or create questionnaire
         questionnaire, created = ContextualQuestionnaire.objects.get_or_create(
@@ -230,7 +300,7 @@ class ContextualQuestionnaireView(APIView):
         )
         
         # Get all questions with choices
-        questions = ContextualQuestion.objects.all().order_by('order')
+        questions = ContextualQuestion.objects.prefetch_related('choices').all().order_by('order')
         
         return Response({
             'questionnaire_id': questionnaire.id,
@@ -240,84 +310,134 @@ class ContextualQuestionnaireView(APIView):
         })
 
     @transaction.atomic
-    def post(self, request):
-        questionnaire = get_object_or_404(
-            ContextualQuestionnaire, 
-            vendor=request.user
-        )
-        
-        if questionnaire.status == 'Submitted':
-            return Response(
-                {'error': 'Questionnaire already submitted'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Save responses and calculate modifier
-        responses = request.data.get('responses', [])
-        total_modifier = 0
-        
-        for response_data in responses:
-            question = get_object_or_404(
-                ContextualQuestion, 
-                id=response_data.get('question_id')
-            )
-            choice = get_object_or_404(
-                ContextualQuestionChoice, 
-                id=response_data.get('choice_id')
+    def post(self, request, action=None):
+        """Handle save and submit actions"""
+        try:
+            questionnaire = get_object_or_404(
+                ContextualQuestionnaire, 
+                vendor=request.user
             )
             
-            response, created = ContextualQuestionnaireResponse.objects.update_or_create(
-                questionnaire=questionnaire,
-                question=question,
-                defaults={'selected_choice': choice}
-            )
-            
-            # Accumulate modifier
-            total_modifier += (choice.modifier * question.weight / 100)
-
-        # Update progress
-        total_questions = ContextualQuestion.objects.count()
-        answered_questions = questionnaire.responses.count()
-        questionnaire.progress = (answered_questions / total_questions) * 100
-
-        # If submitting final
-        if request.data.get('submit', False):
-            if answered_questions < total_questions:
+            if questionnaire.status == 'Submitted':
                 return Response(
-                    {'error': 'All questions must be answered before submission'},
+                    {'error': 'Questionnaire already submitted'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            questionnaire.status = 'Submitted'
-            
-            # Save final risk modifier
-            ContextualRiskModifier.objects.update_or_create(
-                questionnaire=questionnaire,
-                defaults={'calculated_modifier': total_modifier}
-            )
-            
-        questionnaire.save()
 
-        return Response({
-            'status': questionnaire.status,
-            'progress': questionnaire.progress,
-            'calculated_modifier': total_modifier,
-            'message': 'Responses saved successfully'
-        })
+            # Validate and process responses
+            responses = request.data.get('responses', [])
+            if not responses:
+                return Response(
+                    {'error': 'No responses provided'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Process each response
+            saved_responses = []
+            for response_data in responses:
+                question = get_object_or_404(
+                    ContextualQuestion, 
+                    id=response_data.get('question_id')
+                )
+                choice = get_object_or_404(
+                    ContextualQuestionChoice, 
+                    id=response_data.get('choice_id')
+                )
+                
+                response, created = ContextualQuestionnaireResponse.objects.update_or_create(
+                    questionnaire=questionnaire,
+                    question=question,
+                    defaults={'selected_choice': choice}
+                )
+                saved_responses.append(response)
+
+            # Calculate progress
+            questionnaire.progress = self.calculate_progress(questionnaire)
+
+            # Handle submit action
+            if action == 'submit':
+                if not self.validate_completion(questionnaire):
+                    return Response(
+                        {'error': 'All questions must be answered before submission'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                # Calculate final risk modifier
+                risk_modifier = self.calculate_risk_modifier(saved_responses)
+                
+                # Create or update risk modifier record
+                ContextualRiskModifier.objects.update_or_create(
+                    questionnaire=questionnaire,
+                    defaults={'calculated_modifier': risk_modifier}
+                )
+
+                # Update status
+                questionnaire.status = 'Submitted'
+                
+            questionnaire.save()
+
+            # Prepare response data
+            response_data = {
+                'status': questionnaire.status,
+                'progress': questionnaire.progress,
+                'message': 'Questionnaire submitted successfully' if action == 'submit' else 'Progress saved successfully'
+            }
+
+            # Include risk modifier if submitted
+            if action == 'submit':
+                response_data['calculated_modifier'] = risk_modifier
+
+            return Response(response_data)
+
+        except ValidationError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response(
+                {'error': 'An unexpected error occurred', 'detail': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
     
 # Risk Assessment Questionnaire Views
 class RiskAssessmentQuestionnaireView(APIView):
     permission_classes = (IsVendor,)
 
-    def get(self, request):
-        # Verify previous questionnaires are completed
-        if not ContextualQuestionnaire.objects.filter(
-            vendor=request.user, 
-            status='Submitted'
-        ).exists():
-            return Response(
-                {'error': 'Please complete contextual questionnaire first'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+    def validate_request_data(self, request_data, questionnaire):
+        """Validate request data for risk assessment questionnaire"""
+        responses = request_data.get('responses', [])
+        if not responses:
+            raise ValidationError('Responses are required')
+
+        for response_data in responses:
+            if not response_data.get('question_id'):
+                raise ValidationError('question_id is required for each response')
+            
+            try:
+                question = Question.objects.get(id=response_data.get('question_id'))
+            except Question.DoesNotExist:
+                raise ValidationError(f'Invalid question_id: {response_data.get("question_id")}')
+
+            # Validate answer based on question type
+            answer = response_data.get('answer', {})
+            if question.type == 'YN':
+                if not isinstance(answer, bool):
+                    raise ValidationError(f'Boolean answer required for question {question.id}')
+            elif question.type == 'MC':
+                if not response_data.get('choice_id'):
+                    raise ValidationError(f'choice_id required for multiple choice question {question.id}')
+                try:
+                    QuestionChoice.objects.get(id=response_data.get('choice_id'), question=question)
+                except QuestionChoice.DoesNotExist:
+                    raise ValidationError(f'Invalid choice_id for question {question.id}')
+            elif question.type == 'SA':
+                if not isinstance(answer, str) or not answer.strip():
+                    raise ValidationError(f'Text answer required for question {question.id}')
+
+    def get(self, request, action=None):
+        # Validate sequence
+        QuestionnaireSequenceValidator.validate_risk_assessment_status(request.user)
 
         # Get or create questionnaire
         questionnaire, created = RiskAssessmentQuestionnaire.objects.get_or_create(
@@ -326,7 +446,9 @@ class RiskAssessmentQuestionnaireView(APIView):
         )
 
         # Get hierarchical structure
-        main_factors = MainRiskFactor.objects.all().order_by('order')
+        main_factors = MainRiskFactor.objects.prefetch_related(
+            'sub_factors__questions__choices'
+        ).all().order_by('order')
 
         return Response({
             'questionnaire_id': questionnaire.id,
@@ -336,81 +458,112 @@ class RiskAssessmentQuestionnaireView(APIView):
         })
 
     @transaction.atomic
-    def post(self, request):
+    def post(self, request, action=None):
         questionnaire = get_object_or_404(
             RiskAssessmentQuestionnaire, 
             vendor=request.user
         )
 
-        if questionnaire.status not in ['In Progress', 'Submitted']:
+        if questionnaire.status not in ['In Progress']:
             return Response(
                 {'error': 'Questionnaire cannot be modified in current state'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Process responses
-        responses = request.data.get('responses', [])
-        for response_data in responses:
-            question = get_object_or_404(Question, id=response_data.get('question_id'))
-            
-            response_kwargs = {
-                'questionnaire': questionnaire,
-                'question': question
-            }
+        try:
+            # Validate request data
+            self.validate_request_data(request.data, questionnaire)
 
-            if question.type == 'YN':
-                response_kwargs['yes_no_response'] = response_data.get('answer')
-            elif question.type == 'MC':
-                choice = get_object_or_404(
-                    QuestionChoice, 
-                    id=response_data.get('choice_id')
+            # Process responses
+            responses = request.data.get('responses', [])
+            for response_data in responses:
+                question = get_object_or_404(
+                    Question, 
+                    id=response_data.get('question_id')
                 )
-                response_kwargs['selected_choice'] = choice
-            elif question.type == 'SA':
-                response_kwargs['response_text'] = response_data.get('answer')
+                
+                response_kwargs = {
+                    'questionnaire': questionnaire,
+                    'question': question
+                }
 
-            RiskAssessmentResponse.objects.update_or_create(
-                questionnaire=questionnaire,
-                question=question,
-                defaults=response_kwargs
+                if question.type == 'YN':
+                    response_kwargs['yes_no_response'] = response_data.get('answer')
+                elif question.type == 'MC':
+                    choice = get_object_or_404(
+                        QuestionChoice, 
+                        id=response_data.get('choice_id')
+                    )
+                    response_kwargs['selected_choice'] = choice
+                elif question.type == 'SA':
+                    response_kwargs['response_text'] = response_data.get('answer')
+
+                RiskAssessmentResponse.objects.update_or_create(
+                    questionnaire=questionnaire,
+                    question=question,
+                    defaults=response_kwargs
+                )
+
+            # Update progress
+            total_questions = Question.objects.count()
+            answered_questions = questionnaire.responses.count()
+            questionnaire.progress = (answered_questions / total_questions) * 100
+
+            # Handle submission
+            if request.data.get('submit', False):
+                if answered_questions < total_questions:
+                    return Response(
+                        {'error': 'All questions must be answered before submission'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                
+                StatusTransitionValidator.validate_transition(
+                    questionnaire, 
+                    'Submitted'
+                )
+                questionnaire.status = 'Submitted'
+
+            questionnaire.save()
+
+            return Response({
+                'status': questionnaire.status,
+                'progress': questionnaire.progress,
+                'message': 'Responses saved successfully'
+            })
+
+        except ValidationError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
             )
-
-        # Update progress
-        total_questions = Question.objects.count()
-        answered_questions = questionnaire.responses.count()
-        questionnaire.progress = (answered_questions / total_questions) * 100
-
-        # Handle submission
-        if request.data.get('submit', False):
-            if answered_questions < total_questions:
-                return Response(
-                    {'error': 'All questions must be answered before submission'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            questionnaire.status = 'Submitted'
-
-        questionnaire.save()
-
-        return Response({
-            'status': questionnaire.status,
-            'progress': questionnaire.progress,
-            'message': 'Responses saved successfully'
-        })
+        except Exception as e:
+            return Response(
+                {'error': 'An unexpected error occurred'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 class DocumentUploadView(APIView):
     permission_classes = (IsVendor,)
+    
+    def validate_file(self, file):
+        if file.size > settings.MAX_UPLOAD_SIZE:
+            raise ValidationError('File size too large')
+        
+        ext = file.name.split('.')[-1].lower()
+        if ext not in settings.ALLOWED_UPLOAD_TYPES:
+            raise ValidationError('Invalid file type')
 
     def post(self, request):
         questionnaire_id = request.data.get('questionnaire_id')
         question_id = request.data.get('question_id')
         file = request.FILES.get('file')
-
+        
         if not all([questionnaire_id, question_id, file]):
             return Response(
                 {'error': 'Missing required fields'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-
+        
         questionnaire = get_object_or_404(
             RiskAssessmentQuestionnaire, 
             id=questionnaire_id,
@@ -421,34 +574,29 @@ class DocumentUploadView(APIView):
             id=question_id, 
             type='FU'
         )
-
+        
         try:
             # Validate file
-            if file.size > settings.MAX_UPLOAD_SIZE:
-                raise ValidationError('File size too large')
-
-            ext = file.name.split('.')[-1].lower()
-            if ext not in settings.ALLOWED_UPLOAD_TYPES:
-                raise ValidationError('Invalid file type')
-
+            self.validate_file(file)
+            
             document = DocumentSubmission.objects.create(
                 questionnaire=questionnaire,
                 question=question,
                 file=file
             )
-
+            
             return Response({
                 'document_id': document.id,
                 'file_name': file.name,
                 'message': 'File uploaded successfully'
             })
-
+            
         except Exception as e:
             return Response(
                 {'error': str(e)},
                 status=status.HTTP_400_BAD_REQUEST
             )
-
+        
 # RA Team Views
 class RATeamDashboardView(APIView):
     permission_classes = (IsRATeam,)
@@ -470,38 +618,68 @@ class RATeamDashboardView(APIView):
 class RATeamSubmissionView(APIView):
     permission_classes = (IsRATeam,)
 
-    def get(self, request, submission_id):
-        submission = get_object_or_404(
-            RiskAssessmentQuestionnaire, 
-            id=submission_id
-        )
+    def get(self, request, submission_id=None):
+        if submission_id is None:
+            # List view - return all submissions
+            submissions = RiskAssessmentQuestionnaire.objects.filter(
+                status='Submitted'
+            ).select_related('vendor__vendorprofile')
+            
+            return Response([{
+                'id': sub.id,
+                'vendor_name': sub.vendor.vendorprofile.company_name,
+                'submission_date': sub.submission_date,
+                'status': sub.status
+            } for sub in submissions])
+            
+        else:
+            # Detail view - return specific submission
+            submission = get_object_or_404(
+                RiskAssessmentQuestionnaire, 
+                id=submission_id
+            )
 
-        # Get all questionnaire data
-        response_data = {
-            'vendor_info': VendorProfileSerializer(
-                submission.vendor.vendorprofile
-            ).data,
-            'corporate_questionnaire': CorporateQuestionnaireSerializer(
-                submission.vendor.corporatequestionnaire_set.first()
-            ).data,
-            'contextual_questionnaire': ContextualQuestionnaireSerializer(
-                submission.vendor.contextualquestionnaire_set.first()
-            ).data,
-            'risk_assessment': RiskAssessmentQuestionnaireSerializer(
-                submission
-            ).data
-        }
+            # Get main factors and their structure
+            main_factors = MainRiskFactor.objects.prefetch_related(
+                'sub_factors__questions__choices'
+            ).all().order_by('order')
 
-        return Response(response_data)
+            response_data = {
+                'vendor_info': VendorProfileSerializer(
+                    submission.vendor.vendorprofile
+                ).data,
+                'corporate_questionnaire': CorporateQuestionnaireSerializer(
+                    submission.vendor.corporatequestionnaire_set.first()
+                ).data,
+                'contextual_questionnaire': ContextualQuestionnaireSerializer(
+                    submission.vendor.contextualquestionnaire_set.first()
+                ).data,
+                'risk_assessment': {
+                    'id': submission.id,
+                    'status': submission.status,
+                    'progress': submission.progress,
+                    'main_factors': MainRiskFactorSerializer(main_factors, many=True).data,
+                    'responses': RiskAssessmentResponseSerializer(
+                        submission.responses.all(), 
+                        many=True
+                    ).data,
+                    'documents': DocumentSubmissionSerializer(
+                        submission.documents.all(), 
+                        many=True
+                    ).data
+                }
+            }
+
+            return Response(response_data)
 
     @transaction.atomic
-    def post(self, request, submission_id):
+    def post(self, request, submission_id, action=None):
         submission = get_object_or_404(
             RiskAssessmentQuestionnaire, 
             id=submission_id
         )
 
-        if submission.status != 'Submitted':
+        if submission.status not in ['Submitted', 'Under Review']:
             return Response(
                 {'error': 'Invalid submission status'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -514,47 +692,56 @@ class RATeamSubmissionView(APIView):
             defaults={'status': 'In Progress'}
         )
 
-        # Process scores
-        scores = request.data.get('scores', [])
-        for score_data in scores:
-            ManualScore.objects.update_or_create(
-                review=review,
-                question_id=score_data.get('question_id'),
-                defaults={
-                    'score': score_data.get('score'),
-                    'comment': score_data.get('comment', '')
-                }
+        # Start review if needed
+        if submission.status == 'Submitted' and request.data.get('start_review', False):
+            StatusTransitionValidator.validate_transition(
+                submission, 
+                'Under Review'
             )
-
-        # Handle review completion
-        if request.data.get('complete', False):
-            # Verify all required scores are provided
-            required_questions = Question.objects.filter(
-                type__in=['SA', 'FU']
-            )
-            scored_questions = review.scores.values_list('question_id', flat=True)
-
-            if not all(q.id in scored_questions for q in required_questions):
-                return Response(
-                    {'error': 'All required questions must be scored'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-
-            review.status = 'Completed'
-            review.save()
-
-            # Update submission status and trigger risk calculation
             submission.status = 'Under Review'
             submission.save()
 
-            # Trigger async risk calculation
-            calculate_risk_async.delay(submission.id)
+        # Process scores
+        if action == 'score':
+            scores = request.data.get('scores', [])
+            for score_data in scores:
+                ManualScore.objects.update_or_create(
+                    review=review,
+                    question_id=score_data.get('question_id'),
+                    defaults={
+                        'score': score_data.get('score'),
+                        'comment': score_data.get('comment', '')
+                    }
+                )
 
-        return Response({
-            'status': review.status,
-            'message': 'Review updated successfully'
-        })
+        # Handle review completion
+        if action == 'complete':
+            try:
+                # Call risk calculation
+                result = calculate_risk(submission_id)
+                
+                if not result.get('success', False):
+                    return Response({
+                        'error': 'Error calculating risk score',
+                        'detail': result.get('error', 'Unknown error')
+                    }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                
+                return Response({
+                    'status': 'completed',
+                    'risk_calculation': {
+                        'final_score': result['final_score'],
+                        'confidence_interval': result['confidence_interval']
+                    }
+                })
+                
+            except Exception as e:
+                return Response({
+                    'error': 'Error calculating risk score',
+                    'detail': str(e)
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+        # Handle other actions...
+        return Response({'status': 'updated'})
 class RiskScoreView(APIView):
     def get(self, request, submission_id):
         submission = get_object_or_404(
@@ -578,8 +765,6 @@ class RiskScoreView(APIView):
         return Response(
             RiskCalculationSerializer(submission.risk_calculation).data
         )
-    
-# Add to core/views.py
 
 class NotificationView(APIView):
     permission_classes = (IsAuthenticated,)
@@ -611,3 +796,84 @@ class AuditLogView(APIView):
             logs = logs.filter(user_id=request.query_params['user'])
         serializer = AuditLogSerializer(logs, many=True)
         return Response(serializer.data)
+    
+class BaseQuestionnaireView(APIView):
+    def validate_sequence(self, user):
+        if self.questionnaire_type == 'contextual':
+            if not CorporateQuestionnaire.objects.filter(
+                vendor=user, 
+                status='Submitted'
+            ).exists():
+                raise ValidationError('Complete corporate questionnaire first')
+        elif self.questionnaire_type == 'risk_assessment':
+            if not ContextualQuestionnaire.objects.filter(
+                vendor=user, 
+                status='Submitted'
+            ).exists():
+                raise ValidationError('Complete contextual questionnaire first')
+            
+# Add to views.py
+class QuestionnaireSequenceValidator:
+    @staticmethod
+    def validate_corporate_status(vendor):
+        """No prerequisites for corporate questionnaire"""
+        pass
+
+    @staticmethod
+    def validate_contextual_status(vendor):
+        """Check if corporate is completed before contextual"""
+        if not CorporateQuestionnaire.objects.filter(
+            vendor=vendor, 
+            status='Submitted'
+        ).exists():
+            raise ValidationError(
+                'Corporate questionnaire must be completed before starting contextual questionnaire'
+            )
+
+    @staticmethod
+    def validate_risk_assessment_status(vendor):
+        """Check if both corporate and contextual are completed"""
+        if not CorporateQuestionnaire.objects.filter(
+            vendor=vendor, 
+            status='Submitted'
+        ).exists():
+            raise ValidationError(
+                'Corporate questionnaire must be completed before risk assessment'
+            )
+            
+        if not ContextualQuestionnaire.objects.filter(
+            vendor=vendor, 
+            status='Submitted'
+        ).exists():
+            raise ValidationError(
+                'Contextual questionnaire must be completed before risk assessment'
+            )
+
+class StatusTransitionValidator:
+    VALID_TRANSITIONS = {
+        'CorporateQuestionnaire': {
+            'In Progress': ['Submitted'],
+            'Submitted': []  # End state
+        },
+        'ContextualQuestionnaire': {
+            'In Progress': ['Submitted'],
+            'Submitted': []  # End state
+        },
+        'RiskAssessmentQuestionnaire': {
+            'In Progress': ['Submitted'],
+            'Submitted': ['Under Review'],
+            'Under Review': ['Completed'],
+            'Completed': []  # End state
+        }
+    }
+
+    @classmethod
+    def validate_transition(cls, questionnaire, new_status):
+        model_name = questionnaire.__class__.__name__
+        current_status = questionnaire.status
+        valid_transitions = cls.VALID_TRANSITIONS[model_name].get(current_status, [])
+        
+        if new_status not in valid_transitions:
+            raise ValidationError(
+                f'Invalid status transition from {current_status} to {new_status}'
+            )

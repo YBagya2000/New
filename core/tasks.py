@@ -1,6 +1,5 @@
 # core/tasks.py
 
-from celery import shared_task
 from django.db import transaction
 import numpy as np
 from scipy import integrate
@@ -16,7 +15,13 @@ logger = logging.getLogger(__name__)
 
 class FuzzyLogicProcessor:
     def __init__(self):
-        self.risk_levels = ['VLR', 'LR', 'MR', 'HR', 'VHR']
+        self.risk_levels = {
+            'VLR': 0,  # Very Low Risk
+            'LR': 1,   # Low Risk
+            'MR': 2,   # Moderate Risk
+            'HR': 3,   # High Risk
+            'VHR': 4   # Very High Risk
+        }
         self.membership_functions = {
             'VLR': lambda x: self.trapezoidal(x, 8, 9, 10, 10),
             'LR': lambda x: self.triangular(x, 6, 7.5, 9),
@@ -47,64 +52,90 @@ class FuzzyLogicProcessor:
 
     def process_manual_scores(self, questionnaire):
         """Process manually scored questions (SA and DS) using fuzzy logic"""
-        manual_scores = {}
-        
-        for main_factor in MainRiskFactor.objects.all():
-            main_factor_score = 0
+        try:
+            total_score = 0.0
+            total_weight = 0.0
             
-            for sub_factor in SubRiskFactor.objects.filter(main_factor=main_factor):
-                questions = Question.objects.filter(
-                    sub_factor=sub_factor,
-                    type__in=['SA', 'FU']  # Short Answer and File Upload
-                )
-                
-                if not questions:
-                    continue
-                    
-                question_weight = 1.0 / len(questions)  # Equal weight distribution
-                sub_factor_score = 0
-                
-                for question in questions:
-                    try:
-                        manual_score = ManualScore.objects.get(
-                            review__questionnaire=questionnaire,
-                            question=question
-                        )
-                        
-                        # Calculate fuzzy membership values
-                        fuzzy_values = {
-                            level: func(manual_score.score) 
-                            for level, func in self.membership_functions.items()
-                        }
-                        
-                        # Defuzzify to get crisp score
-                        crisp_score = self.defuzzify(fuzzy_values)
-                        sub_factor_score += crisp_score * question_weight
-                        
-                    except ManualScore.DoesNotExist:
-                        logger.warning(f"No manual score found for question {question.id}")
-                        continue
-                
-                # Apply sub-factor weight
-                main_factor_score += sub_factor_score * sub_factor.weight
+            manual_scores = ManualScore.objects.filter(
+                review__questionnaire=questionnaire,
+                question__type__in=['SA', 'FU']
+            ).select_related('question', 'question__sub_factor', 'question__sub_factor__main_factor')
             
-            # Apply main factor weight
-            manual_scores[main_factor.id] = main_factor_score * main_factor.weight
-        
-        return manual_scores
+            if not manual_scores.exists():
+                logger.warning(f"No manual scores found for questionnaire {questionnaire.id}")
+                return 0.0
+
+            for score in manual_scores:
+                # Get weights
+                main_factor_weight = float(score.question.sub_factor.main_factor.weight)
+                sub_factor_weight = float(score.question.sub_factor.weight)
+                
+                # Calculate fuzzy value
+                fuzzy_values = {
+                    level: func(float(score.score)) 
+                    for level, func in self.membership_functions.items()
+                }
+                
+                # Defuzzify to get crisp score
+                crisp_score = self.defuzzify(fuzzy_values)
+                
+                # Apply weights
+                weighted_score = crisp_score * main_factor_weight * sub_factor_weight
+                
+                total_score += weighted_score
+                total_weight += (main_factor_weight * sub_factor_weight)
+
+                logger.debug(f"""
+                    Processed manual score:
+                    Question: {score.question.id}
+                    Raw score: {score.score}
+                    Crisp score: {crisp_score}
+                    Weighted score: {weighted_score}
+                """)
+            
+            final_score = total_score / total_weight if total_weight > 0 else 0.0
+            return final_score
+            
+        except Exception as e:
+            logger.error(f"Error processing manual scores: {str(e)}")
+            raise ValueError(f"Error processing manual scores: {str(e)}")
 
     def defuzzify(self, fuzzy_values):
         """Defuzzify using centroid method"""
-        numerator = sum(score * membership for score, membership in fuzzy_values.items())
-        denominator = sum(fuzzy_values.values())
-        return numerator / denominator if denominator else 0
+        try:
+            # Convert fuzzy values to numeric scores
+            numeric_values = {}
+            for risk_level, membership in fuzzy_values.items():
+                # Use center points for each risk level
+                center_points = {
+                    'VLR': 9.0,  # Center of VLR trapezoid
+                    'LR': 7.5,   # Peak of LR triangle
+                    'MR': 5.0,   # Peak of MR triangle
+                    'HR': 2.5,   # Peak of HR triangle
+                    'VHR': 1.0   # Center of VHR trapezoid
+                }
+                numeric_values[center_points[risk_level]] = float(membership)
+
+            # Calculate centroid
+            numerator = sum(score * membership for score, membership in numeric_values.items())
+            denominator = sum(float(val) for val in numeric_values.values())
+            
+            if denominator == 0:
+                return 5.0  # Default middle score if no membership values
+                
+            return numerator / denominator
+            
+        except Exception as e:
+            logger.error(f"Defuzzification error: {str(e)}")
+            raise ValueError(f"Error in defuzzification: {str(e)}")
 
 def calculate_initial_score(questionnaire):
     """Calculate initial scores for Y/N and MC questions"""
-    main_factor_scores = {}
+    total_score = 0.0
+    total_weight = 0.0
     
     for main_factor in MainRiskFactor.objects.all():
-        main_factor_score = 0
+        main_factor_score = 0.0
         
         for sub_factor in SubRiskFactor.objects.filter(main_factor=main_factor):
             questions = Question.objects.filter(
@@ -115,8 +146,8 @@ def calculate_initial_score(questionnaire):
             if not questions:
                 continue
                 
-            question_weight = 1.0 / len(questions)  # Equal weight distribution
-            sub_factor_score = 0
+            question_weight = 1.0 / len(questions) if questions else 0  # Equal weight distribution
+            sub_factor_score = 0.0
             
             for question in questions:
                 try:
@@ -126,9 +157,9 @@ def calculate_initial_score(questionnaire):
                     )
                     
                     if question.type == 'YN':
-                        score = 10 if response.yes_no_response else 0
+                        score = 10.0 if response.yes_no_response else 0.0
                     else:  # MC
-                        score = response.selected_choice.score if response.selected_choice else 0
+                        score = float(response.selected_choice.score) if response.selected_choice else 0.0
                     
                     sub_factor_score += score * question_weight
                     
@@ -136,13 +167,14 @@ def calculate_initial_score(questionnaire):
                     logger.warning(f"No response found for question {question.id}")
                     continue
             
-            # Apply sub-factor weight
-            main_factor_score += sub_factor_score * sub_factor.weight
-        
+           # Apply sub-factor weight
+            main_factor_score += sub_factor_score * float(sub_factor.weight)
+            
         # Apply main factor weight
-        main_factor_scores[main_factor.id] = main_factor_score * main_factor.weight
+        total_score += main_factor_score * float(main_factor.weight)
+        total_weight += float(main_factor.weight)
     
-    return sum(main_factor_scores.values())
+    return total_score / total_weight if total_weight > 0 else 0.0
 
 def calculate_contextual_modifier(questionnaire):
     """Calculate risk modifier from contextual questionnaire"""
@@ -152,8 +184,8 @@ def calculate_contextual_modifier(questionnaire):
             status='Submitted'
         )
         
-        total_modifier = 0
-        total_weight = 0
+        total_modifier = 0.0
+        total_weight = 0.0
         
         for response in contextual.responses.all():
             question = response.question
@@ -164,7 +196,7 @@ def calculate_contextual_modifier(questionnaire):
             total_modifier += modifier
             total_weight += question.weight
         
-        if total_weight == 0:
+        if total_weight == 0.0:
             raise ValidationError("Invalid contextual questionnaire weights")
             
         return total_modifier / total_weight
@@ -177,99 +209,121 @@ def calculate_contextual_modifier(questionnaire):
 def perform_monte_carlo(score, iterations=10000):
     """Perform Monte Carlo simulation for confidence interval"""
     try:
+        # Ensure input score is float
+        input_score = float(score)
+        
         # Generate samples around the score
         std_dev = 0.5  # Configurable standard deviation
-        samples = np.random.normal(score, std_dev, iterations)
         
-        # Clip values to valid range
+        # Use numpy for efficient computation
+        import numpy as np
+        samples = np.random.normal(input_score, std_dev, iterations)
+        
+        # Clip values to valid range [0, 10]
         samples = np.clip(samples, 0, 10)
         
         # Calculate statistics
-        mean_score = np.mean(samples)
-        confidence_low = np.percentile(samples, 2.5)  # 95% confidence interval
-        confidence_high = np.percentile(samples, 97.5)
+        mean_score = float(np.mean(samples))
+        confidence_low = float(np.percentile(samples, 2.5))  # 95% confidence interval
+        confidence_high = float(np.percentile(samples, 97.5))
+        
+        logger.debug(f"""
+            Monte Carlo simulation results:
+            Input score: {input_score}
+            Mean: {mean_score}
+            Confidence interval: [{confidence_low}, {confidence_high}]
+        """)
         
         return mean_score, confidence_low, confidence_high
         
     except Exception as e:
-        raise Exception(f"Error in Monte Carlo simulation: {str(e)}")
+        logger.error(f"Monte Carlo simulation error: {str(e)}")
+        raise ValueError(f"Error in Monte Carlo simulation: {str(e)}")
 
-def combine_scores(initial_scores, manual_scores):
+def combine_scores(initial_score, manual_scores):
     """Combine initial and manual scores"""
-    total_score = 0
-    
-    for main_factor in MainRiskFactor.objects.all():
-        # Get both types of scores for this factor
-        initial = initial_scores.get(main_factor.id, 0)
-        manual = manual_scores.get(main_factor.id, 0)
+    try:
+        # Ensure both scores are float values
+        initial_score = float(initial_score)
         
-        # Combine scores (could be weighted differently if needed)
-        factor_score = initial + manual
-        total_score += factor_score
-    
-    return total_score
+        # If manual_scores is a dict, calculate weighted average
+        if isinstance(manual_scores, dict):
+            total_manual = sum(float(score) for score in manual_scores.values())
+            num_scores = len(manual_scores)
+            manual_avg = total_manual / num_scores if num_scores > 0 else 0
+        else:
+            manual_avg = float(manual_scores)
+        
+        # Equal weight to automatic and manual scores
+        combined_score = (initial_score + manual_avg) / 2.0
+        
+        return max(0.0, min(10.0, combined_score))  # Ensure score is between 0 and 10
+        
+    except Exception as e:
+        logger.error(f"Error combining scores: {str(e)}")
+        raise ValueError(f"Error combining scores: {str(e)}")
 
-@shared_task
-def calculate_risk_async(questionnaire_id):
-    """Asynchronous task to calculate risk score"""
+def calculate_risk(questionnaire_id):
     logger.info(f"Starting risk calculation for questionnaire {questionnaire_id}")
     
     try:
         with transaction.atomic():
             questionnaire = RiskAssessmentQuestionnaire.objects.get(id=questionnaire_id)
             
-            # Verify questionnaire is ready for calculation
             if questionnaire.status != 'Under Review':
                 raise ValidationError("Invalid questionnaire status for calculation")
             
-            # 1. Calculate initial scores (Y/N and MC questions)
-            logger.debug("Calculating initial scores...")
-            initial_scores = calculate_initial_score(questionnaire)
+            # 1. Calculate initial scores
+            initial_score = calculate_initial_score(questionnaire)
+            logger.debug(f"Initial score calculated: {initial_score}")
             
-            # 2. Process manual scores with fuzzy logic (SA and DS questions)
-            logger.debug("Processing manual scores...")
+            # 2. Process manual scores
             fuzzy_processor = FuzzyLogicProcessor()
-            manual_scores = fuzzy_processor.process_manual_scores(questionnaire)
+            manual_score = fuzzy_processor.process_manual_scores(questionnaire)
+            logger.debug(f"Manual score calculated: {manual_score}")
             
             # 3. Combine scores
-            logger.debug("Combining scores...")
-            base_score = combine_scores(initial_scores, manual_scores)
+            base_score = combine_scores(initial_score, manual_score)
+            logger.debug(f"Combined base score: {base_score}")
             
-            # 4. Calculate and apply contextual modifier
-            logger.debug("Applying contextual modifier...")
-            contextual_modifier = calculate_contextual_modifier(questionnaire)
-            adjusted_score = base_score * (1 + contextual_modifier)
+            # 4. Calculate contextual modifier
+            modifier = calculate_contextual_modifier(questionnaire)
+            adjusted_score = base_score * (1 + modifier)
+            logger.debug(f"Adjusted score with modifier: {adjusted_score}")
             
-            # 5. Perform Monte Carlo simulation
-            logger.debug("Performing Monte Carlo simulation...")
-            final_score, confidence_low, confidence_high = perform_monte_carlo(adjusted_score)
+            # 5. Monte Carlo simulation
+            final_score, conf_low, conf_high = perform_monte_carlo(adjusted_score)
+            logger.debug(f"Final score after Monte Carlo: {final_score}")
             
-            # Save calculation results
-            RiskCalculation.objects.update_or_create(
+            # Save results
+            calculation = RiskCalculation.objects.create(
                 questionnaire=questionnaire,
-                defaults={
-                    'initial_score': base_score,
-                    'fuzzy_score': manual_scores,
-                    'weighted_score': base_score,
-                    'contextual_score': adjusted_score,
-                    'final_score': final_score,
-                    'confidence_interval_low': confidence_low,
-                    'confidence_interval_high': confidence_high
-                }
+                initial_score=float(initial_score),
+                fuzzy_score=float(manual_score),
+                weighted_score=float(base_score),
+                contextual_score=float(adjusted_score),
+                final_score=float(final_score),
+                confidence_interval_low=float(conf_low),
+                confidence_interval_high=float(conf_high)
             )
             
-            # Update questionnaire status
+            # Update status
             questionnaire.status = 'Completed'
             questionnaire.save()
             
-            # Notify relevant users
-            logger.info(f"Risk calculation completed for questionnaire {questionnaire_id}")
+            return {
+                'success': True,
+                'questionnaire_id': questionnaire_id,
+                'final_score': final_score,
+                'confidence_interval': {
+                    'low': conf_low,
+                    'high': conf_high
+                }
+            }
             
-            return True
-            
-    except ValidationError as e:
-        logger.error(f"Validation error in risk calculation: {str(e)}")
-        raise
     except Exception as e:
         logger.error(f"Error in risk calculation: {str(e)}")
-        raise
+        return {
+            'success': False,
+            'error': str(e)
+        }
