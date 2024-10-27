@@ -116,6 +116,17 @@ urlpatterns = [
         views.AuditLogView.as_view(), 
         name='audit-logs'
     ),
+    # Vendor access to their own analysis
+    path(f'{API_VERSION}/vendor/risk-analysis/', 
+        views.RiskAnalysisView.as_view(),
+        name='vendor-risk-analysis'
+    ),
+    
+    # RA Team access to any submission's analysis
+    path(f'{API_VERSION}/ra-team/risk-analysis/<int:submission_id>/',
+        views.RiskAnalysisView.as_view(),
+        name='ra-team-risk-analysis'
+    )
 ]
 
 # Add URLs for serving media files in development

@@ -1,5 +1,6 @@
 # core/serializers.py
 
+from django.db import transaction
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from .models import (
@@ -35,19 +36,33 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         fields = ('email', 'username', 'password', 'company_name')
 
     def create(self, validated_data):
-        company_name = validated_data.pop('company_name')
-        user = User.objects.create_user(
-            role='Vendor',
-            **validated_data
-        )
-        VendorProfile.objects.create(user=user, company_name=company_name)
-        return user
+        try:
+            with transaction.atomic():
+                company_name = validated_data.pop('company_name')
+                
+                # Create user
+                user = User.objects.create_user(
+                    role='Vendor',
+                    **validated_data
+                )
+
+                # Create vendor profile
+                VendorProfile.objects.create(
+                    user=user,
+                    company_name=company_name
+                )
+
+                return user
+                
+        except Exception as e:
+            raise serializers.ValidationError(str(e))
 
 # Corporate Questionnaire Serializers
 class CorporateQuestionStructureSerializer(serializers.ModelSerializer):
     class Meta:
         model = CorporateQuestionStructure
         fields = '__all__'
+        ordering = ['order']
 
 class CorporateQuestionnaireResponseSerializer(serializers.ModelSerializer):
     class Meta:

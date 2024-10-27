@@ -4,9 +4,9 @@ from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from django.shortcuts import get_object_or_404
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from rest_framework.permissions import AllowAny, IsAuthenticated, BasePermission
 from django.contrib.auth import authenticate
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -46,11 +46,37 @@ class RegisterView(APIView):
     def post(self, request):
         serializer = UserRegistrationSerializer(data=request.data)
         if serializer.is_valid():
-            user = serializer.save()
-            return Response({
-                'user': UserSerializer(user).data,
-                'message': 'User registered successfully'
-            }, status=status.HTTP_201_CREATED)
+            try:
+                with transaction.atomic():
+                    # Create user first
+                    user = serializer.save()
+                    
+                    # Refresh tokens
+                    refresh = RefreshToken.for_user(user)
+                    
+                    return Response({
+                        'user': UserSerializer(user).data,
+                        'tokens': {
+                            'refresh': str(refresh),
+                            'access': str(refresh.access_token),
+                        },
+                        'message': 'User registered successfully'
+                    }, status=status.HTTP_201_CREATED)
+            except IntegrityError as e:
+                # If there's any integrity error, delete the user and return error
+                if user:
+                    user.delete()
+                return Response({
+                    'error': 'Registration failed. Please try again.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            except Exception as e:
+                # If there's any other error, delete the user and return error
+                if user:
+                    user.delete()
+                return Response({
+                    'error': str(e)
+                }, status=status.HTTP_400_BAD_REQUEST)
+                
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
 class LoginView(APIView):
@@ -624,6 +650,7 @@ class RATeamDashboardView(APIView):
     permission_classes = (IsRATeam,)
 
     def get(self, request):
+        # Only show submissions that are in 'Submitted' status
         pending_submissions = RiskAssessmentQuestionnaire.objects.filter(
             status='Submitted'
         ).select_related('vendor__vendorprofile')
@@ -651,6 +678,7 @@ class RATeamSubmissionView(APIView):
             )
 
             # Get corporate questionnaire with full question data
+            
             corporate_questionnaire = CorporateQuestionnaire.objects.filter(
                 vendor=submission.vendor
             ).prefetch_related('responses__question').first()
@@ -708,6 +736,79 @@ class RATeamSubmissionView(APIView):
             } if contextual_questionnaire else None
 
             # Rest of the response data structure...
+            responses_by_question = {
+                response.question_id: response 
+                for response in submission.responses.all()
+            }
+            
+            documents_by_question = {
+                doc.question_id: doc 
+                for doc in submission.documents.all()
+            }
+
+            
+
+            # Get main factors with integrated responses
+            main_factors = MainRiskFactor.objects.prefetch_related(
+                'sub_factors__questions__choices'
+            ).all().order_by('order')
+
+            risk_assessment_data = []
+            for factor in main_factors:
+                factor_data = {
+                    'id': factor.id,
+                    'name': factor.name,
+                    'weight': factor.weight,
+                    'sub_factors': []
+                }
+                
+                for sub_factor in factor.sub_factors.all():
+                    sub_factor_data = {
+                        'id': sub_factor.id,
+                        'name': sub_factor.name,
+                        'weight': sub_factor.weight,
+                        'questions': []
+                    }
+                    
+                    for question in sub_factor.questions.all():
+                        response = responses_by_question.get(question.id)
+                        document = documents_by_question.get(question.id)
+                        
+                        question_data = {
+                            'id': question.id,
+                            'text': question.text,
+                            'type': question.type,
+                            'weight': question.weight,
+                            'choices': [
+                                {
+                                    'id': choice.id,
+                                    'text': choice.text,
+                                    'score': choice.score
+                                } for choice in question.choices.all()
+                            ] if question.type == 'MC' else None,
+                            'answer': {
+                                'value': None,
+                                'file_url': document.file.url if document else None,
+                                'requires_scoring': question.type in ['SA', 'FU'],
+                                'score': None,
+                                'ra_comment': None
+                            }
+                        }
+
+                        if response:
+                            if question.type == 'YN':
+                                question_data['answer']['value'] = response.yes_no_response
+                            elif question.type == 'MC':
+                                question_data['answer']['value'] = response.selected_choice_id
+                            elif question.type == 'SA':
+                                question_data['answer']['value'] = response.response_text
+
+                        sub_factor_data['questions'].append(question_data)
+                    
+                    factor_data['sub_factors'].append(sub_factor_data)
+                
+                risk_assessment_data.append(factor_data)
+
             response_data = {
                 'vendor_info': VendorProfileSerializer(
                     submission.vendor.vendorprofile
@@ -717,22 +818,13 @@ class RATeamSubmissionView(APIView):
                 'risk_assessment': {
                     'id': submission.id,
                     'status': submission.status,
-                    'main_factors': MainRiskFactorSerializer(
-                        MainRiskFactor.objects.prefetch_related(
-                            'sub_factors__questions__choices'
-                        ).all().order_by('order'),
-                        many=True
-                    ).data,
-                    'responses': RiskAssessmentResponseSerializer(
-                        submission.responses.all(), 
-                        many=True
-                    ).data,
-                    'documents': DocumentSubmissionSerializer(
-                        submission.documents.all(), 
-                        many=True
-                    ).data
+                    'main_factors': risk_assessment_data
                 }
             }
+
+            if document:
+                file_url = request.build_absolute_uri(document.file.url)
+                question_data['answer']['file_url'] = file_url
 
             return Response(response_data)
 
@@ -810,6 +902,18 @@ class RATeamSubmissionView(APIView):
                 )
 
             try:
+
+                # Check if calculation already exists
+                existing_calculation = RiskCalculation.objects.filter(
+                    questionnaire=submission
+                ).exists()
+                
+                if existing_calculation:
+                    return Response(
+                        {'error': 'Risk calculation already exists for this submission'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
                 # Update status
                 submission.status = 'Under Review'
                 submission.save()
@@ -837,6 +941,8 @@ class RATeamSubmissionView(APIView):
                 })
 
             except Exception as e:
+                submission.status = 'Submitted'
+                submission.save()
                 return Response(
                     {'error': str(e)},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -980,4 +1086,32 @@ class StatusTransitionValidator:
         if new_status not in valid_transitions:
             raise ValidationError(
                 f'Invalid status transition from {current_status} to {new_status}'
+            )
+        
+
+class RiskAnalysisView(APIView):
+    def get(self, request):
+        try:
+            calculation = RiskCalculation.objects.get(
+                questionnaire__vendor=request.user,
+                questionnaire__status='Completed'
+            )
+            
+            print("Calculation stages:", calculation.calculation_stages)
+            print("Factor scores:", calculation.factor_scores)
+
+            return Response({
+                'final_score': float(calculation.final_score),
+                'confidence_interval': {
+                    'low': float(calculation.confidence_interval_low),
+                    'high': float(calculation.confidence_interval_high)
+                },
+                'calculation_stages': calculation.calculation_stages,
+                'factor_scores': calculation.factor_scores
+            })
+            
+        except RiskCalculation.DoesNotExist:
+            return Response(
+                {'error': 'Risk calculation not found'},
+                status=status.HTTP_404_NOT_FOUND
             )

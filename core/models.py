@@ -19,6 +19,7 @@ class User(AbstractUser):
     REQUIRED_FIELDS = ['username']
 
 class VendorProfile(models.Model):
+    id = models.AutoField(primary_key=True)
     user = models.OneToOneField(User, on_delete=models.CASCADE)
     company_name = models.CharField(max_length=200)
     industry_sector = models.CharField(max_length=100)
@@ -295,6 +296,8 @@ class RiskCalculation(models.Model):
     confidence_interval_low = models.FloatField()
     confidence_interval_high = models.FloatField()
     calculation_date = models.DateTimeField(auto_now_add=True)
+    factor_scores = models.JSONField(null=True)  # Stores scores for each main factor
+    calculation_stages = models.JSONField(null=True)  # Stores data about each calculation stage
 
     def __str__(self):
         return f"Risk Calculation for {self.questionnaire.vendor.email}"
