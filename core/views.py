@@ -14,6 +14,12 @@ from .tasks import calculate_risk
 from risk_assessment_system import settings
 from .models import *
 from .serializers import *
+import logging
+
+import logging
+logger = logging.getLogger(__name__)
+
+
 
 from django.http import JsonResponse
 
@@ -1090,28 +1096,117 @@ class StatusTransitionValidator:
         
 
 class RiskAnalysisView(APIView):
+    def get(self, request, submission_id=None):
+        if submission_id is None:
+            try:
+                calculation = RiskCalculation.objects.get(
+                    questionnaire__vendor=request.user,
+                    questionnaire__status='Completed'
+                )
+
+                return Response({
+                    'final_score': float(calculation.final_score),
+                    'confidence_interval': {
+                        'low': float(calculation.confidence_interval_low),
+                        'high': float(calculation.confidence_interval_high)
+                    },
+                    'calculation_stages': calculation.calculation_stages,
+                    'factor_scores': calculation.factor_scores
+                })
+
+            except RiskCalculation.DoesNotExist:
+                return Response(
+                    {'error': 'Risk calculation not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        else:
+            try:
+                calculation = RiskCalculation.objects.get(
+                    questionnaire__id=submission_id,
+                    questionnaire__status='Completed'
+                )
+
+                # Check permissions
+                if request.user != calculation.questionnaire.vendor and request.user.role != 'RA_Team':
+                    return Response(
+                        {'error': 'Permission denied'},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+
+                return Response({
+                    'final_score': float(calculation.final_score),
+                    'confidence_interval': {
+                        'low': float(calculation.confidence_interval_low),
+                        'high': float(calculation.confidence_interval_high)
+                    },
+                    'calculation_stages': calculation.calculation_stages,
+                    'factor_scores': calculation.factor_scores
+                })
+
+            except RiskCalculation.DoesNotExist:
+                return Response(
+                    {'error': 'Risk calculation not found'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+# views.py
+
+class RATeamAnalysisListView(APIView):
+    permission_classes = (IsRATeam,)
+
     def get(self, request):
         try:
-            calculation = RiskCalculation.objects.get(
-                questionnaire__vendor=request.user,
+            calculations = RiskCalculation.objects.filter(
                 questionnaire__status='Completed'
+            ).select_related(
+                'questionnaire__vendor__vendorprofile'
             )
-            
-            print("Calculation stages:", calculation.calculation_stages)
-            print("Factor scores:", calculation.factor_scores)
 
-            return Response({
-                'final_score': float(calculation.final_score),
-                'confidence_interval': {
-                    'low': float(calculation.confidence_interval_low),
-                    'high': float(calculation.confidence_interval_high)
-                },
-                'calculation_stages': calculation.calculation_stages,
-                'factor_scores': calculation.factor_scores
-            })
-            
-        except RiskCalculation.DoesNotExist:
+            analyses = []
+            for calc in calculations:
+                analyses.append({
+                    'id': calc.questionnaire.id,
+                    'vendor_name': calc.questionnaire.vendor.vendorprofile.company_name,
+                    'final_score': float(calc.final_score),
+                    'confidence_interval': {
+                        'low': float(calc.confidence_interval_low),
+                        'high': float(calc.confidence_interval_high)
+                    },
+                    'submission_date': calc.calculation_date
+                })
+
+            return Response(analyses)
+        except Exception as e:
             return Response(
-                {'error': 'Risk calculation not found'},
+                {'error': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+class RATeamAnalysisDetailView(APIView):
+    permission_classes = (IsRATeam,)
+
+    def get(self, request, submission_id):  # Changed to match your pattern
+        submission = get_object_or_404(
+            RiskAssessmentQuestionnaire,
+            id=submission_id
+        )
+
+        if not hasattr(submission, 'risk_calculation'):
+            return Response(
+                {'error': 'Risk calculation not completed'},
                 status=status.HTTP_404_NOT_FOUND
             )
+
+        calculation = submission.risk_calculation
+        
+        return Response({
+            'vendor_info': VendorProfileSerializer(
+                submission.vendor.vendorprofile
+            ).data,
+            'final_score': float(calculation.final_score),
+            'confidence_interval': {
+                'low': float(calculation.confidence_interval_low),
+                'high': float(calculation.confidence_interval_high)
+            },
+            'calculation_stages': calculation.calculation_stages,
+            'factor_scores': calculation.factor_scores
+        })

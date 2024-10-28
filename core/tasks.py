@@ -3,7 +3,7 @@
 from django.db import transaction
 import numpy as np
 from scipy import integrate
-import logging
+
 from .models import (
     RiskAssessmentQuestionnaire, RiskCalculation, ManualScore,
     MainRiskFactor, SubRiskFactor, Question, RiskAssessmentResponse,
@@ -11,6 +11,7 @@ from .models import (
 )
 from django.core.exceptions import ValidationError
 
+import logging
 logger = logging.getLogger(__name__)
 
 class FuzzyLogicProcessor:
@@ -262,7 +263,7 @@ def combine_scores(initial_score, manual_scores):
             manual_avg = float(manual_scores.score if hasattr(manual_scores, 'score') else manual_scores)
         
         # Equal weight to automatic and manual scores
-        combined_score = (initial_score + manual_avg) / 2.0
+        combined_score = (initial_score + manual_avg)
         
         return max(0.0, min(10.0, combined_score))  # Ensure score is between 0 and 10
         

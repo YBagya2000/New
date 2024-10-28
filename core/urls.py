@@ -126,7 +126,15 @@ urlpatterns = [
     path(f'{API_VERSION}/ra-team/risk-analysis/<int:submission_id>/',
         views.RiskAnalysisView.as_view(),
         name='ra-team-risk-analysis'
-    )
+    ),
+    path(f'{API_VERSION}/ra-team/risk-analysis/', 
+        views.RATeamAnalysisListView.as_view(),
+        name='ra-team-analysis-list'
+    ),
+    path(f'{API_VERSION}/ra-team/risk-analysis/<int:submission_id>/',  # Changed to submission_id
+        views.RATeamAnalysisDetailView.as_view(),
+        name='ra-team-analysis-detail'
+    ),
 ]
 
 # Add URLs for serving media files in development
