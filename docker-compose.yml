@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres
+    container_name: postgres-container
+    environment:
+      POSTGRES_USER: ra_user
+      POSTGRES_PASSWORD: 1111
+      POSTGRES_DB: risk_assessment_project
+    network_mode: "host"  # Expose ports to the host network
+
+  web:
+    build: .
+    container_name: web-container
+    command: >
+      sh -c "
+        pip install -r requirements.txt &&
+        python manage.py migrate &&
+        python manage.py seed_data &&
+        python manage.py runserver 0.0.0.0:8000
+      "
+    volumes:
+      - .:/app  # Mounting the current directory to /app in the container
+    depends_on:
+      - postgres
+    network_mode: "host"  # Expose ports to the host network
+
+volumes:
+  postgres_data:
+
